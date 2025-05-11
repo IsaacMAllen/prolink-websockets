@@ -23,6 +23,6 @@ public class LoadCommandConsumer {
                 e.printStackTrace();
             }
         });
-        App.getTrackWebSocketServer().start();
+        App.getLoadWebSocketServer().start();
     }
 }

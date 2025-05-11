@@ -7,25 +7,22 @@ import org.java_websocket.WebSocket;
 import org.java_websocket.handshake.ClientHandshake;
 
 import java.net.InetSocketAddress;
-import java.nio.charset.StandardCharsets;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.Set;
+import java.nio.ByteBuffer;
+import java.util.Map;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 public class ProLinkWebSocketServer extends WebSocketServer {
-
     private Consumer<String> messageHandler = null;
     private final ObjectMapper mapper = new ObjectMapper();
+    private final Map<WebSocket, ClientConnection> clients = new ConcurrentHashMap<>();
 
-    private final Set<WebSocket> clients = Collections.synchronizedSet(new HashSet<>());
-    private final ExecutorService sendExecutor = new ThreadPoolExecutor(
-            4, 4,
-            0L, TimeUnit.MILLISECONDS,
-            new LinkedBlockingQueue<>(128),
-            new ThreadPoolExecutor.DiscardPolicy()
-    );
+    private final ByteBuffer framePool = ByteBuffer.allocateDirect(FRAME_SIZE);
+
+    private static final int FRAME_SIZE = 800 * 200 * 4;
+
+    private final ConcurrentLinkedQueue<byte[]> pendingBinaryMessages = new ConcurrentLinkedQueue<>();
 
     public ProLinkWebSocketServer(int port) {
         super(new InetSocketAddress(port));
@@ -33,13 +30,20 @@ public class ProLinkWebSocketServer extends WebSocketServer {
 
     @Override
     public void onOpen(WebSocket conn, ClientHandshake handshake) {
-        clients.add(conn);
+        clients.put(conn, new ClientConnection(conn));
         System.out.println("Client connected: " + conn.getRemoteSocketAddress());
+
+        // Flush pending binary messages to new client
+        byte[] msg;
+        while ((msg = pendingBinaryMessages.poll()) != null) {
+            conn.send(msg);
+        }
     }
 
     @Override
     public void onClose(WebSocket conn, int code, String reason, boolean remote) {
-        clients.remove(conn);
+        ClientConnection removed = clients.remove(conn);
+        if (removed != null) removed.shutdown();
         System.out.println("Client disconnected");
     }
 
@@ -60,31 +64,41 @@ public class ProLinkWebSocketServer extends WebSocketServer {
         System.out.println("WebSocket server started");
     }
 
-    /**
-     * Broadcasts the given RGBA frame to all connected clients.
-     *
-     * Assumes that the caller will not modify the buffer after this call.
-     * If mutation is possible, the caller should pass a clone instead.
-     */
-    public void broadcastFrame(byte[] rawRgbaFrame) {
-        sendExecutor.submit(() -> {
-            synchronized (clients) {
-                for (WebSocket client : clients) {
-                    if (client.isOpen()) {
-                        try {
-                            client.send(rawRgbaFrame);
-                        } catch (Exception e) {
-                            e.printStackTrace();
-                        }
+    private final ExecutorService websocketExecutor = Executors.newFixedThreadPool(64);
+
+    private final AtomicReference<ByteBuffer> latestFrame = new AtomicReference<>();
+
+    public void broadcastFrame(ByteBuffer rawRgbaBuffer) {
+        synchronized (framePool) {
+            framePool.clear();
+            framePool.put(rawRgbaBuffer.asReadOnlyBuffer());
+            framePool.flip();
+            latestFrame.set(framePool.asReadOnlyBuffer()); // this is cheap
+        }
+    }
+
+    {
+        Thread dispatcher = new Thread(() -> {
+            while (true) {
+                ByteBuffer frame = latestFrame.getAndSet(null);
+                if (frame != null) {
+                    for (ClientConnection conn : clients.values()) {
+                        conn.sendFrame(frame); // aggressively drops old frames
                     }
                 }
+                try {
+                    Thread.sleep(1); // low CPU
+                } catch (InterruptedException ignored) {}
             }
-        });
+        }, "WebSocket-BroadcastDispatcher");
+        dispatcher.setDaemon(true);
+        dispatcher.start();
     }
 
     public void broadcastStatus(DeviceStatus status) {
         try {
-            broadcastJsonBytes(mapper.writeValueAsString(status));
+            byte[] bytes = mapper.writeValueAsBytes(status);
+            broadcastJsonBytes(bytes);
         } catch (JsonProcessingException e) {
             throw new RuntimeException(e);
         }
@@ -92,35 +106,37 @@ public class ProLinkWebSocketServer extends WebSocketServer {
 
     public void broadcastTrack(Track track) {
         try {
-            broadcastJsonBytes(mapper.writeValueAsString(track));
+            byte[] bytes = mapper.writeValueAsBytes(track);
+            broadcastJsonBytes(bytes);
         } catch (JsonProcessingException e) {
             throw new RuntimeException(e);
         }
     }
 
-    private void broadcastJsonBytes(String s) {
-        try {
-            String json = s;
-            byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
+    private void broadcastJsonBytes(byte[] bytes) {
+        for (ClientConnection conn : clients.values()) {
+            websocketExecutor.submit(() -> conn.sendFrame(bytes));
+        }
+    }
 
-            sendExecutor.submit(() -> {
-                synchronized (clients) {
-                    for (WebSocket client : clients) {
-                        if (client.isOpen()) {
-                            client.send(bytes);
-                        }
-                    }
-                }
-            });
-        } catch (Exception e) {
-            e.printStackTrace();
+    public void broadcastRawBytes(byte[] bytes) {
+        if (clients.isEmpty()) {
+            // No clients yet — queue for later
+            pendingBinaryMessages.add(bytes);
+        } else {
+            for (ClientConnection conn : clients.values()) {
+                websocketExecutor.submit(() -> conn.sendFrame(bytes));
+            }
         }
     }
 
     public void setMessageHandler(Consumer<String> handler) {
         this.messageHandler = handler;
     }
+
     public void shutdown() {
-        sendExecutor.shutdown();
+        for (ClientConnection conn : clients.values()) {
+            conn.shutdown();
+        }
     }
 }

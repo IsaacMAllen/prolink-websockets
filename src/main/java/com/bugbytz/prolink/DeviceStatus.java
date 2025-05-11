@@ -16,4 +16,5 @@ public class DeviceStatus {
     private String macAddress;
     private int rekordboxId;
     private String deviceName;
+    private boolean isMaster;
 }

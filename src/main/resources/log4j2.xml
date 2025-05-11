@@ -8,8 +8,8 @@
 
     <Loggers>
         <!-- Enable DEBUG for beat-link -->
-        <Logger name="org.deepsymmetry" level="debug" additivity="false">
-            <AppenderRef ref="Console"/>
+        <Logger name="org.deepsymmetry" level="off" additivity="false">
+<!--            <AppenderRef ref="Console"/>-->
         </Logger>
 
         <!-- Root logger for everything else -->

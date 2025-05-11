@@ -3,18 +3,16 @@ package com.bugbytz.prolink;
 import org.deepsymmetry.beatlink.*;
 import org.deepsymmetry.beatlink.data.*;
 
-import java.awt.*;
-import java.awt.image.BufferedImage;
-import java.awt.image.DataBufferByte;
+import java.nio.ByteBuffer;
 import java.text.DecimalFormat;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class App {
-    private static final int FPS = 60;
+    private static final int FPS = 30;
     private static final int FRAME_INTERVAL_MS = 1000 / FPS;
-    private static final int WIDTH = 1200;
+    private static final int WIDTH = 800;
     private static final int HEIGHT = 200;
 
     private static final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
@@ -39,15 +37,25 @@ public class App {
 
     private static final Map<Integer, ScheduledFuture<?>> schedules = new ConcurrentHashMap<>();
     private static final Set<Integer> streamingPlayers = ConcurrentHashMap.newKeySet();
-    private static final Map<Integer, WaveformDetailComponent> waveformComponents = new ConcurrentHashMap<>();
-    private static final Map<Integer, ReentrantLock> playerLocks = new ConcurrentHashMap<>();
-    private static final Map<Integer, Long> lastPlaybackTimeMap = new ConcurrentHashMap<>();
     private static final Map<Integer, ProLinkWebSocketServer> frameServers = new ConcurrentHashMap<>();
-    private static final Map<Integer, byte[]> rgbaBuffers = new ConcurrentHashMap<>();
+    private static final Map<Integer, ProLinkWebSocketServer> artServers = new ConcurrentHashMap<>();
 
     private static final ProLinkWebSocketServer trackWebSocketServer = new ProLinkWebSocketServer(2000);
     private static final ProLinkWebSocketServer deviceWebSocketServer = new ProLinkWebSocketServer(3000);
     private static final ProLinkWebSocketServer loadWebSocketServer = new ProLinkWebSocketServer(4000);
+    private static final Map<Integer, AtomicBoolean> rendering = new ConcurrentHashMap<>();
+    private static final Map<Integer, AtomicBoolean> deviceSending = new ConcurrentHashMap<>();
+
+    private static final Map<Integer, Long> playbackTimeCache = new ConcurrentHashMap<>();
+    private static final Map<Integer, Long> playbackTimeTimestamp = new ConcurrentHashMap<>();
+    private static final long CACHE_VALIDITY_NS = 1_000_000; // 1ms
+
+    private static final Map<Integer, Long> lastGoodRenderTime = new ConcurrentHashMap<>();
+    private static final Map<Integer, ByteBuffer> nativeRgbaBuffers = new ConcurrentHashMap<>();
+
+    private static long getMonotonicRenderTime(int player, long newTime) {
+        return lastGoodRenderTime.merge(player, newTime, Math::max);
+    }
 
     public static ProLinkWebSocketServer getTrackWebSocketServer() {
         return trackWebSocketServer;
@@ -65,27 +73,30 @@ public class App {
         return sb.toString();
     }
 
-    private static byte[] convertABGRtoRGBA(byte[] abgr, byte[] rgba) {
-        for (int i = 0; i < abgr.length; i += 4) {
-            byte a = abgr[i];
-            byte b = abgr[i + 1];
-            byte g = abgr[i + 2];
-            byte r = abgr[i + 3];
-
-            rgba[i] = r;
-            rgba[i + 1] = g;
-            rgba[i + 2] = b;
-            rgba[i + 3] = a;
+    private static long getStablePlaybackTime(int player) {
+        long now = System.nanoTime();
+        long lastQueryTime = playbackTimeTimestamp.getOrDefault(player, 0L);
+        if (now - lastQueryTime < CACHE_VALIDITY_NS) {
+            return playbackTimeCache.getOrDefault(player, 0L);
+        } else {
+            long newTime = TimeFinder.getInstance().getTimeFor(player);
+            playbackTimeCache.put(player, newTime);
+            playbackTimeTimestamp.put(player, now);
+            return newTime;
         }
-        return rgba;
     }
 
     private static void getWaveformForPlayer(int player) {
+        if (rendering.computeIfAbsent(player, p -> new AtomicBoolean(false)).getAndSet(true)) {
+            return;
+        }
+
         renderExecutor.submit(() -> {
             try {
                 if (!WaveformFinder.getInstance().isRunning()) {
                     WaveformFinder.getInstance().start();
                 }
+
                 WaveformDetail detail = WaveformFinder.getInstance().getLatestDetailFor(player);
                 if (detail == null) return;
 
@@ -95,82 +106,104 @@ public class App {
                     return server;
                 });
 
-                WaveformDetailComponent component = waveformComponents.computeIfAbsent(player, p -> {
-                    WaveformDetailComponent c = (WaveformDetailComponent) detail.createViewComponent(
-                            MetadataFinder.getInstance().getLatestMetadataFor(player),
-                            BeatGridFinder.getInstance().getLatestBeatGridFor(player));
-                    c.setPreferredSize(new Dimension(WIDTH, HEIGHT));
-                    c.setSize(WIDTH, HEIGHT);
-                    c.setScale(1);
-                    c.setMonitoredPlayer(player);
-                    c.setAutoScroll(true);
-                    return c;
-                });
+                ByteBuffer buffer = nativeRgbaBuffers.computeIfAbsent(player,
+                        p -> ByteBuffer.allocateDirect(WIDTH * HEIGHT * 4)); // RGBA
 
-                // Create a copy of the image to render into
-                BufferedImage frameCopy = new BufferedImage(WIDTH, HEIGHT, BufferedImage.TYPE_4BYTE_ABGR);
+                long renderStart = System.nanoTime();
+                ByteBuffer waveDataRaw = detail.getData();
+                ByteBuffer waveData = ByteBuffer.allocateDirect(waveDataRaw.capacity());
+                waveData.put(waveDataRaw);
+                waveData.rewind();
+                long queriedTime = getStablePlaybackTime(player);
+                long renderNow = System.nanoTime();
+                long renderTime = queriedTime + ((renderNow - playbackTimeTimestamp.getOrDefault(player, renderNow)) / 1_000_000);
+                int halfFrameOffset = Util.timeToHalfFrame(renderTime);
+                NativeWaveformRenderer.render(
+                        waveData,
+                        detail.getFrameCount(),
+                        detail.style.ordinal(),
+                        halfFrameOffset,
+                        1,
+                        WIDTH,
+                        HEIGHT,
+                        buffer
+                );
 
-                ReentrantLock lock = playerLocks.computeIfAbsent(player, p -> new ReentrantLock());
+                printIfOver(renderStart, 154, player);
 
-                long currentTime;
-                lock.lock();
-                try {
-                    currentTime = TimeFinder.getInstance().getTimeFor(player);
-                    component.setPlaybackState(player, currentTime, true);
+                // Send buffer to clients
+                wsServer.broadcastFrame(buffer); // you must support ByteBuffer here now
 
-                    Graphics2D g = frameCopy.createGraphics();
-                    g.setBackground(Color.BLACK);
-                    g.clearRect(0, 0, WIDTH, HEIGHT);
-                    component.paint(g);
-                    g.dispose();
-
-                    lastPlaybackTimeMap.put(player, currentTime);
-                } finally {
-                    lock.unlock();
-                }
-
-                byte[] rawPixels = ((DataBufferByte) frameCopy.getRaster().getDataBuffer()).getData();
-                byte[] rgbaBuffer = rgbaBuffers.computeIfAbsent(player, p -> new byte[WIDTH * HEIGHT * 4]);
-                wsServer.broadcastFrame(convertABGRtoRGBA(rawPixels, rgbaBuffer));
-
+                printIfOver(renderStart, 167, player);
             } catch (Exception e) {
                 e.printStackTrace();
+            } finally {
+                rendering.get(player).set(false);
             }
         });
     }
 
+    public static void printIfOver(long beforeSend, int lineNumber, int player) {
+        long afterSend = System.nanoTime();
+        long delta = (afterSend - beforeSend) / 1_000_000;
+        if (delta >= 19)
+            System.out.printf("Player %d: Time ALARM %d ms LINE %d\n", player, delta, lineNumber);
+    }
+
     public static void main(String[] args) throws Exception {
-        VirtualCdj.getInstance().setDeviceNumber((byte) 1);
+        VirtualCdj.getInstance().setDeviceNumber((byte) 5);
         CrateDigger.getInstance().addDatabaseListener(new DBService());
 
         VirtualCdj.getInstance().addUpdateListener(update -> {
             if (update instanceof CdjStatus cdjStatus) {
                 int deviceNumber = update.getDeviceNumber();
+                AtomicBoolean sendingFlag = deviceSending.computeIfAbsent(deviceNumber, k -> new AtomicBoolean(false));
+
+                if (!sendingFlag.compareAndSet(false, true)) {
+                    return;
+                }
+
                 DecimalFormat df = new DecimalFormat("#.##");
-                DeviceAnnouncement announcement = DeviceFinder.getInstance().getLatestAnnouncementFrom(deviceNumber);
-                if (announcement == null) return;
+                try {
+                    DeviceAnnouncement announcement = DeviceFinder.getInstance().getLatestAnnouncementFrom(deviceNumber);
+                    if (announcement == null) return;
 
-                DeviceStatus deviceStatus = new DeviceStatus(
-                        deviceNumber,
-                        cdjStatus.isPlaying() || !cdjStatus.isPaused(),
-                        cdjStatus.getBeatNumber(),
-                        update.getBeatWithinBar(),
-                        Double.parseDouble(df.format(update.getEffectiveTempo())),
-                        Double.parseDouble(df.format(Util.pitchToPercentage(update.getPitch()))),
-                        update.getAddress().getHostAddress(),
-                        byteArrayToMacString(announcement.getHardwareAddress()),
-                        cdjStatus.getRekordboxId(),
-                        update.getDeviceName()
-                );
+                    DeviceStatus deviceStatus = new DeviceStatus(
+                            deviceNumber,
+                            cdjStatus.isPlaying() || !cdjStatus.isPaused(),
+                            cdjStatus.getBeatNumber(),
+                            update.getBeatWithinBar(),
+                            Double.parseDouble(df.format(update.getEffectiveTempo())),
+                            Double.parseDouble(df.format(Util.pitchToPercentage(update.getPitch()))),
+                            update.getAddress().getHostAddress(),
+                            byteArrayToMacString(announcement.getHardwareAddress()),
+                            cdjStatus.getRekordboxId(),
+                            update.getDeviceName(),
+                            cdjStatus.isTempoMaster()
+                    );
 
-                deviceWebSocketServer.broadcastStatus(deviceStatus);
+                    deviceWebSocketServer.broadcastStatus(deviceStatus);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                } finally {
+                    sendingFlag.set(false);
+                }
             }
         });
 
         DeviceFinder.getInstance().addDeviceAnnouncementListener(new DeviceAnnouncementAdapter() {
             @Override
             public void deviceFound(DeviceAnnouncement announcement) {
+                if (!VirtualCdj.getInstance().isRunning()) {
+                    try {
+                        VirtualCdj.getInstance().start();
+                        CrateDigger.getInstance().start();
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                }
                 int player = announcement.getDeviceNumber();
+
                 if (streamingPlayers.add(player)) {
                     ScheduledFuture<?> future = scheduler.scheduleAtFixedRate(
                             () -> getWaveformForPlayer(player), 0, FRAME_INTERVAL_MS, TimeUnit.MILLISECONDS);
@@ -191,15 +224,36 @@ public class App {
                 }
             }
         });
+
+        ArtFinder.getInstance().setRequestHighResolutionArt(true);
+        ArtFinder.getInstance().addAlbumArtListener(update -> {
+            ProLinkWebSocketServer wsServer = artServers.computeIfAbsent(update.player, p -> {
+                ProLinkWebSocketServer server = new ProLinkWebSocketServer(6000 + p);
+                server.start();
+                return server;
+            });
+            ByteBuffer buffer = update.art.getRawBytes();
+            byte[] bytes;
+
+            if (buffer.hasArray()) {
+                // Use backing array if available (faster)
+                bytes = buffer.array();
+            } else {
+                // Copy content into a new array
+                bytes = new byte[buffer.remaining()];
+                buffer.mark(); // mark the current position
+                buffer.get(bytes);
+                buffer.reset(); // reset back to the original position if needed
+            }
+            wsServer.broadcastRawBytes(bytes);
+        });
+        ArtFinder.getInstance().start();
         BeatGridFinder.getInstance().start();
         MetadataFinder.getInstance().start();
-        VirtualCdj.getInstance().start();
         TimeFinder.getInstance().start();
         DeviceFinder.getInstance().start();
-        CrateDigger.getInstance().start();
         trackWebSocketServer.start();
         deviceWebSocketServer.start();
-
         LoadCommandConsumer consumer = new LoadCommandConsumer();
         Thread consumerThread = new Thread(consumer::startConsuming);
         consumerThread.start();
@@ -210,6 +264,15 @@ public class App {
             loadWebSocketServer.shutdown();
             trackWebSocketServer.shutdown();
             deviceWebSocketServer.shutdown();
+            CrateDigger.getInstance().stop();
+            DeviceFinder.getInstance().stop();
+            TimeFinder.getInstance().stop();
+            MetadataFinder.getInstance().stop();
+            BeatGridFinder.getInstance().stop();
+            VirtualCdj.getInstance().stop();
+            ArtFinder.getInstance().stop();
+            artServers.forEach((player, server) -> server.shutdown());
+            frameServers.forEach((player, server) -> server.shutdown());
         }));
     }
 }
