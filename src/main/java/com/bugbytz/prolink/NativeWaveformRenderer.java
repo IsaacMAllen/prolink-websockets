@@ -16,7 +16,6 @@ public class NativeWaveformRenderer {
     public static native void render(
             ByteBuffer waveData,
             int frameCount,
-            int styleOrdinal,
             int halfFrameOffset,
             int scale,
             int width,

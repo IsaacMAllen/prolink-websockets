@@ -121,7 +121,6 @@ public class App {
                 NativeWaveformRenderer.render(
                         waveData,
                         detail.getFrameCount(),
-                        detail.style.ordinal(),
                         halfFrameOffset,
                         1,
                         WIDTH,

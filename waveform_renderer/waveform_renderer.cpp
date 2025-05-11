@@ -8,14 +8,13 @@ extern "C" JNIEXPORT void JNICALL Java_com_bugbytz_prolink_NativeWaveformRendere
     jclass,
     jobject waveDataBuffer,
     jint frameCount,
-    jint styleOrdinal,
     jint halfFrameOffset,
     jint scale,
     jint width,
     jint height,
     jobject outputRgbaBuffer
 ) {
-    styleOrdinal = 0;
+    int styleOrdinal = 0;
     uint8_t* waveData = static_cast<uint8_t*>(env->GetDirectBufferAddress(waveDataBuffer));
     uint8_t* output = static_cast<uint8_t*>(env->GetDirectBufferAddress(outputRgbaBuffer));
     if (!waveData || !output) {
