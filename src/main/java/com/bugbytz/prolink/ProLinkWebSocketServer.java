@@ -8,6 +8,9 @@ import org.java_websocket.handshake.ClientHandshake;
 
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicReference;
@@ -23,6 +26,7 @@ public class ProLinkWebSocketServer extends WebSocketServer {
     private static final int FRAME_SIZE = 800 * 200 * 4;
 
     private final ConcurrentLinkedQueue<byte[]> pendingBinaryMessages = new ConcurrentLinkedQueue<>();
+    private final ConcurrentLinkedQueue<byte[]> pendingJsonMessages = new ConcurrentLinkedQueue<>();
 
     public ProLinkWebSocketServer(int port) {
         super(new InetSocketAddress(port));
@@ -36,6 +40,11 @@ public class ProLinkWebSocketServer extends WebSocketServer {
         // Flush pending binary messages to new client
         byte[] msg;
         while ((msg = pendingBinaryMessages.poll()) != null) {
+            conn.send(msg);
+        }
+
+        // Also flush pending JSON messages
+        while ((msg = pendingJsonMessages.poll()) != null) {
             conn.send(msg);
         }
     }
@@ -114,8 +123,12 @@ public class ProLinkWebSocketServer extends WebSocketServer {
     }
 
     private void broadcastJsonBytes(byte[] bytes) {
-        for (ClientConnection conn : clients.values()) {
-            websocketExecutor.submit(() -> conn.sendFrame(bytes));
+        if (clients.isEmpty()) {
+            pendingJsonMessages.add(bytes);
+        } else {
+            for (ClientConnection conn : clients.values()) {
+                websocketExecutor.submit(() -> conn.sendFrame(bytes));
+            }
         }
     }
 
