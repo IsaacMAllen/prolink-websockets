@@ -3,169 +3,132 @@ package com.bugbytz.prolink;
 import org.deepsymmetry.beatlink.*;
 import org.deepsymmetry.beatlink.data.*;
 
-import java.nio.ByteBuffer;
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.awt.image.DataBufferByte;
 import java.text.DecimalFormat;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class App {
-    private static final int FPS = 30;
-    private static final int FRAME_INTERVAL_MS = 1000 / FPS;
-    private static final int WIDTH = 800;
-    private static final int HEIGHT = 200;
+    // Must match WAVE_W × WAVE_H in camera-prolink.cpp
+    private static final int STATIC_WIDTH  = 800;
+    private static final int STATIC_HEIGHT = 200;
 
-    private static final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
-    private static final ExecutorService renderExecutor = new ThreadPoolExecutor(
-            8, 8,
-            0L, TimeUnit.MILLISECONDS,
-            new LinkedBlockingQueue<>(16),
-            new ThreadFactory() {
-                private final ThreadFactory defaultFactory = Executors.defaultThreadFactory();
-                private int threadCount = 1;
+    // Small pool: renders are one-shot per track-load, not 30/60 Hz.
+    private static final ExecutorService renderExecutor = Executors.newFixedThreadPool(4);
 
-                @Override
-                public Thread newThread(Runnable r) {
-                    Thread t = defaultFactory.newThread(r);
-                    t.setName("RenderThread-" + threadCount++);
-                    t.setPriority(Thread.MAX_PRIORITY);
-                    return t;
-                }
-            },
-            new ThreadPoolExecutor.DiscardPolicy()
-    );
+    // Static full-track waveform servers: port 8001-8004 (one per player).
+    // Sends a single 800×200 RGBA frame when a track loads; client caches it
+    // and animates a local playhead from beat+tempo in DeviceStatus.
+    private static final Map<Integer, ProLinkWebSocketServer> staticWaveServers = new ConcurrentHashMap<>();
+    private static final Map<Integer, byte[]>                 rgbaBuffers        = new ConcurrentHashMap<>();
 
-    private static final Map<Integer, ScheduledFuture<?>> schedules = new ConcurrentHashMap<>();
-    private static final Set<Integer> streamingPlayers = ConcurrentHashMap.newKeySet();
-    private static final Map<Integer, ProLinkWebSocketServer> frameServers = new ConcurrentHashMap<>();
+    // Album art servers: port 6001-6004 (unchanged from minisforum branch).
     private static final Map<Integer, ProLinkWebSocketServer> artServers = new ConcurrentHashMap<>();
 
-    private static final ProLinkWebSocketServer trackWebSocketServer = new ProLinkWebSocketServer(2000);
+    private static final ProLinkWebSocketServer trackWebSocketServer  = new ProLinkWebSocketServer(2000);
     private static final ProLinkWebSocketServer deviceWebSocketServer = new ProLinkWebSocketServer(3000);
-    private static final ProLinkWebSocketServer loadWebSocketServer = new ProLinkWebSocketServer(4000);
-    private static final Map<Integer, AtomicBoolean> rendering = new ConcurrentHashMap<>();
+    private static final ProLinkWebSocketServer loadWebSocketServer   = new ProLinkWebSocketServer(4000);
+
     private static final Map<Integer, AtomicBoolean> deviceSending = new ConcurrentHashMap<>();
 
-    private static final Map<Integer, Long> playbackTimeCache = new ConcurrentHashMap<>();
-    private static final Map<Integer, Long> playbackTimeTimestamp = new ConcurrentHashMap<>();
-    private static final long CACHE_VALIDITY_NS = 1_000_000; // 1ms
-
-    private static final Map<Integer, Long> lastGoodRenderTime = new ConcurrentHashMap<>();
-    private static final Map<Integer, ByteBuffer> nativeRgbaBuffers = new ConcurrentHashMap<>();
-
-    private static long getMonotonicRenderTime(int player, long newTime) {
-        return lastGoodRenderTime.merge(player, newTime, Math::max);
-    }
-
-    public static ProLinkWebSocketServer getTrackWebSocketServer() {
-        return trackWebSocketServer;
-    }
-
-    public static ProLinkWebSocketServer getLoadWebSocketServer() {
-        return loadWebSocketServer;
-    }
+    public static ProLinkWebSocketServer getTrackWebSocketServer() { return trackWebSocketServer; }
+    public static ProLinkWebSocketServer getLoadWebSocketServer()  { return loadWebSocketServer; }
 
     public static String byteArrayToMacString(byte[] macBytes) {
         StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < macBytes.length; i++) {
+        for (int i = 0; i < macBytes.length; i++)
             sb.append(String.format("%02X%s", macBytes[i], (i < macBytes.length - 1) ? ":" : ""));
-        }
         return sb.toString();
     }
 
-    private static long getStablePlaybackTime(int player) {
-        long now = System.nanoTime();
-        long lastQueryTime = playbackTimeTimestamp.getOrDefault(player, 0L);
-        if (now - lastQueryTime < CACHE_VALIDITY_NS) {
-            return playbackTimeCache.getOrDefault(player, 0L);
-        } else {
-            long newTime = TimeFinder.getInstance().getTimeFor(player);
-            playbackTimeCache.put(player, newTime);
-            playbackTimeTimestamp.put(player, now);
-            return newTime;
+    // BufferedImage.TYPE_4BYTE_ABGR stores [A, B, G, R]; we need [R, G, B, A] for the client.
+    private static void convertABGRtoRGBA(byte[] abgr, byte[] rgba) {
+        for (int i = 0; i < abgr.length; i += 4) {
+            rgba[i]     = abgr[i + 3]; // R
+            rgba[i + 1] = abgr[i + 2]; // G
+            rgba[i + 2] = abgr[i + 1]; // B
+            rgba[i + 3] = abgr[i];     // A
         }
     }
 
-    private static void getWaveformForPlayer(int player) {
-        if (rendering.computeIfAbsent(player, p -> new AtomicBoolean(false)).getAndSet(true)) {
-            return;
-        }
-
+    /**
+     * Renders a full-track waveform preview (STATIC_WIDTH × STATIC_HEIGHT, RGBA) for
+     * {@code player} and broadcasts it to all connected clients on port {@code 8000 + player}.
+     *
+     * Triggered once when the waveform preview data becomes available (i.e. a new track loads).
+     * The client caches this texture and animates a local playhead using beat + tempo from the
+     * continuous DeviceStatus stream — no further frames are sent until the next track change.
+     */
+    private static void sendStaticWaveformForPlayer(int player) {
         renderExecutor.submit(() -> {
             try {
-                if (!WaveformFinder.getInstance().isRunning()) {
-                    WaveformFinder.getInstance().start();
+                WaveformPreview preview = WaveformFinder.getInstance().getLatestPreviewFor(player);
+                if (preview == null) {
+                    System.out.println("No waveform preview yet for player " + player + "; skipping.");
+                    return;
                 }
 
-                WaveformDetail detail = WaveformFinder.getInstance().getLatestDetailFor(player);
-                if (detail == null) return;
+                TrackMetadata meta     = MetadataFinder.getInstance().getLatestMetadataFor(player);
+                BeatGrid      beatGrid = BeatGridFinder.getInstance().getLatestBeatGridFor(player);
 
-                ProLinkWebSocketServer wsServer = frameServers.computeIfAbsent(player, p -> {
-                    ProLinkWebSocketServer server = new ProLinkWebSocketServer(5000 + p);
-                    server.start();
-                    return server;
+                // WaveformPreviewComponent renders the full track as a compact overview strip.
+                WaveformPreviewComponent comp =
+                        (WaveformPreviewComponent) preview.createViewComponent(meta, beatGrid);
+                comp.setPreferredSize(new Dimension(STATIC_WIDTH, STATIC_HEIGHT));
+                comp.setSize(STATIC_WIDTH, STATIC_HEIGHT);
+
+                BufferedImage img = new BufferedImage(STATIC_WIDTH, STATIC_HEIGHT,
+                                                      BufferedImage.TYPE_4BYTE_ABGR);
+                Graphics2D g = img.createGraphics();
+                g.setRenderingHint(RenderingHints.KEY_ANTIALIASING,  RenderingHints.VALUE_ANTIALIAS_ON);
+                g.setRenderingHint(RenderingHints.KEY_RENDERING,     RenderingHints.VALUE_RENDER_QUALITY);
+                g.setBackground(Color.BLACK);
+                g.clearRect(0, 0, STATIC_WIDTH, STATIC_HEIGHT);
+                comp.paint(g);
+                g.dispose();
+
+                byte[] rawPixels = ((DataBufferByte) img.getRaster().getDataBuffer()).getData();
+                byte[] rgba = rgbaBuffers.computeIfAbsent(player,
+                        p -> new byte[STATIC_WIDTH * STATIC_HEIGHT * 4]);
+                convertABGRtoRGBA(rawPixels, rgba);
+
+                ProLinkWebSocketServer srv = staticWaveServers.computeIfAbsent(player, p -> {
+                    ProLinkWebSocketServer s = new ProLinkWebSocketServer(8000 + p);
+                    s.start();
+                    System.out.println("Static waveform server started on port " + (8000 + p));
+                    return s;
                 });
 
-                ByteBuffer buffer = nativeRgbaBuffers.computeIfAbsent(player,
-                        p -> ByteBuffer.allocateDirect(WIDTH * HEIGHT * 4)); // RGBA
+                // Pass a clone so the rgbaBuffers slot can be reused for future track loads.
+                srv.broadcastRawBytes(rgba.clone());
+                System.out.println("Static waveform broadcast for player " + player);
 
-                long renderStart = System.nanoTime();
-                ByteBuffer waveDataRaw = detail.getData();
-                ByteBuffer waveData = ByteBuffer.allocateDirect(waveDataRaw.capacity());
-                waveData.put(waveDataRaw);
-                waveData.rewind();
-                long queriedTime = getStablePlaybackTime(player);
-                long renderNow = System.nanoTime();
-                long renderTime = queriedTime + ((renderNow - playbackTimeTimestamp.getOrDefault(player, renderNow)) / 1_000_000);
-                int halfFrameOffset = Util.timeToHalfFrame(renderTime);
-                NativeWaveformRenderer.render(
-                        waveData,
-                        detail.getFrameCount(),
-                        detail.style.ordinal(),
-                        halfFrameOffset,
-                        1,
-                        WIDTH,
-                        HEIGHT,
-                        buffer
-                );
-
-                printIfOver(renderStart, 154, player);
-
-                // Send buffer to clients
-                wsServer.broadcastFrame(buffer); // you must support ByteBuffer here now
-
-                printIfOver(renderStart, 167, player);
             } catch (Exception e) {
                 e.printStackTrace();
-            } finally {
-                rendering.get(player).set(false);
             }
         });
-    }
-
-    public static void printIfOver(long beforeSend, int lineNumber, int player) {
-        long afterSend = System.nanoTime();
-        long delta = (afterSend - beforeSend) / 1_000_000;
-        if (delta >= 19)
-            System.out.printf("Player %d: Time ALARM %d ms LINE %d\n", player, delta, lineNumber);
     }
 
     public static void main(String[] args) throws Exception {
         VirtualCdj.getInstance().setDeviceNumber((byte) 5);
         CrateDigger.getInstance().addDatabaseListener(new DBService());
 
+        // DeviceStatus (beat, tempo, pitch, isMaster, etc.) — consumed by the client to
+        // calculate the live playhead position against the static waveform texture.
         VirtualCdj.getInstance().addUpdateListener(update -> {
             if (update instanceof CdjStatus cdjStatus) {
                 int deviceNumber = update.getDeviceNumber();
-                AtomicBoolean sendingFlag = deviceSending.computeIfAbsent(deviceNumber, k -> new AtomicBoolean(false));
-
-                if (!sendingFlag.compareAndSet(false, true)) {
-                    return;
-                }
+                AtomicBoolean sendingFlag =
+                        deviceSending.computeIfAbsent(deviceNumber, k -> new AtomicBoolean(false));
+                if (!sendingFlag.compareAndSet(false, true)) return;
 
                 DecimalFormat df = new DecimalFormat("#.##");
                 try {
-                    DeviceAnnouncement announcement = DeviceFinder.getInstance().getLatestAnnouncementFrom(deviceNumber);
+                    DeviceAnnouncement announcement =
+                            DeviceFinder.getInstance().getLatestAnnouncementFrom(deviceNumber);
                     if (announcement == null) return;
 
                     DeviceStatus deviceStatus = new DeviceStatus(
@@ -181,13 +144,36 @@ public class App {
                             update.getDeviceName(),
                             cdjStatus.isTempoMaster()
                     );
-
                     deviceWebSocketServer.broadcastStatus(deviceStatus);
                 } catch (Exception e) {
                     e.printStackTrace();
                 } finally {
                     sendingFlag.set(false);
                 }
+            }
+        });
+
+        // Fire a one-shot static waveform render whenever a new waveform preview arrives.
+        // This is the primary trigger: preview data becomes available shortly after a track
+        // loads, making it the earliest reliable signal for full-track waveform data.
+        WaveformFinder.getInstance().addWaveformListener(new WaveformListener() {
+            @Override
+            public void waveformPreviewChanged(WaveformPreviewUpdate update) {
+                if (update.preview != null) {
+                    sendStaticWaveformForPlayer(update.player);
+                }
+            }
+
+            @Override
+            public void waveformDetailChanged(WaveformDetailUpdate update) {
+                // Detail not used — playhead is computed client-side.
+            }
+        });
+
+        // Secondary trigger: resend if metadata arrives after the waveform event fired.
+        MetadataFinder.getInstance().addTrackMetadataListener(update -> {
+            if (update.metadata != null) {
+                sendStaticWaveformForPlayer(update.player);
             }
         });
 
@@ -202,29 +188,22 @@ public class App {
                         throw new RuntimeException(e);
                     }
                 }
-                int player = announcement.getDeviceNumber();
-
-                if (streamingPlayers.add(player)) {
-                    ScheduledFuture<?> future = scheduler.scheduleAtFixedRate(
-                            () -> getWaveformForPlayer(player), 0, FRAME_INTERVAL_MS, TimeUnit.MILLISECONDS);
-                    schedules.put(player, future);
-                }
             }
 
             @Override
             public void deviceLost(DeviceAnnouncement announcement) {
                 int player = announcement.getDeviceNumber();
-                ScheduledFuture<?> future = schedules.remove(player);
-                if (future != null) future.cancel(true);
-                streamingPlayers.remove(player);
-                ProLinkWebSocketServer wsServer = frameServers.get(announcement.getDeviceNumber());
-                if (wsServer != null) {
-                    wsServer.shutdown();
-                    frameServers.remove(announcement.getDeviceNumber());
+                ProLinkWebSocketServer srv = staticWaveServers.remove(player);
+                if (srv != null) {
+                    srv.shutdown();
+                    System.out.println("Static waveform server shut down for player " + player);
                 }
+                rgbaBuffers.remove(player);
+                deviceSending.remove(player);
             }
         });
 
+        // Album art — ports 6001-6004 (unchanged).
         ArtFinder.getInstance().setRequestHighResolutionArt(true);
         ArtFinder.getInstance().addAlbumArtListener(update -> {
             ProLinkWebSocketServer wsServer = artServers.computeIfAbsent(update.player, p -> {
@@ -232,34 +211,32 @@ public class App {
                 server.start();
                 return server;
             });
-            ByteBuffer buffer = update.art.getRawBytes();
+            java.nio.ByteBuffer buffer = update.art.getRawBytes();
             byte[] bytes;
-
             if (buffer.hasArray()) {
-                // Use backing array if available (faster)
                 bytes = buffer.array();
             } else {
-                // Copy content into a new array
                 bytes = new byte[buffer.remaining()];
-                buffer.mark(); // mark the current position
+                buffer.mark();
                 buffer.get(bytes);
-                buffer.reset(); // reset back to the original position if needed
+                buffer.reset();
             }
             wsServer.broadcastRawBytes(bytes);
         });
+
         ArtFinder.getInstance().start();
+        WaveformFinder.getInstance().start();
         BeatGridFinder.getInstance().start();
         MetadataFinder.getInstance().start();
         TimeFinder.getInstance().start();
         DeviceFinder.getInstance().start();
         trackWebSocketServer.start();
         deviceWebSocketServer.start();
+
         LoadCommandConsumer consumer = new LoadCommandConsumer();
-        Thread consumerThread = new Thread(consumer::startConsuming);
-        consumerThread.start();
+        new Thread(consumer::startConsuming).start();
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            scheduler.shutdown();
             renderExecutor.shutdown();
             loadWebSocketServer.shutdown();
             trackWebSocketServer.shutdown();
@@ -269,10 +246,11 @@ public class App {
             TimeFinder.getInstance().stop();
             MetadataFinder.getInstance().stop();
             BeatGridFinder.getInstance().stop();
+            WaveformFinder.getInstance().stop();
             VirtualCdj.getInstance().stop();
             ArtFinder.getInstance().stop();
-            artServers.forEach((player, server) -> server.shutdown());
-            frameServers.forEach((player, server) -> server.shutdown());
+            artServers.forEach((p, s) -> s.shutdown());
+            staticWaveServers.forEach((p, s) -> s.shutdown());
         }));
     }
 }

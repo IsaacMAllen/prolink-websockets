@@ -28,6 +28,10 @@ public class ProLinkWebSocketServer extends WebSocketServer {
     private final ConcurrentLinkedQueue<byte[]> pendingBinaryMessages = new ConcurrentLinkedQueue<>();
     private final ConcurrentLinkedQueue<byte[]> pendingJsonMessages = new ConcurrentLinkedQueue<>();
 
+    // Cached so reconnecting clients immediately receive the latest waveform/art
+    // without waiting for the next track-load event.
+    private volatile byte[] lastBinaryFrame = null;
+
     public ProLinkWebSocketServer(int port) {
         super(new InetSocketAddress(port));
     }
@@ -37,10 +41,20 @@ public class ProLinkWebSocketServer extends WebSocketServer {
         clients.put(conn, new ClientConnection(conn));
         System.out.println("Client connected: " + conn.getRemoteSocketAddress());
 
-        // Flush pending binary messages to new client
+        // Flush any binary messages that arrived before the first client connected.
+        boolean hadPendingBinary = false;
         byte[] msg;
         while ((msg = pendingBinaryMessages.poll()) != null) {
             conn.send(msg);
+            hadPendingBinary = true;
+        }
+        // If the queue was already empty, other clients were connected when the last
+        // frame was sent — replay the cached frame so this client isn't left blank.
+        if (!hadPendingBinary) {
+            byte[] last = lastBinaryFrame;
+            if (last != null) {
+                try { conn.send(last); } catch (Exception ignored) {}
+            }
         }
 
         // Also flush pending JSON messages
@@ -133,6 +147,7 @@ public class ProLinkWebSocketServer extends WebSocketServer {
     }
 
     public void broadcastRawBytes(byte[] bytes) {
+        lastBinaryFrame = bytes; // cache for reconnecting clients
         if (clients.isEmpty()) {
             // No clients yet — queue for later
             pendingBinaryMessages.add(bytes);
