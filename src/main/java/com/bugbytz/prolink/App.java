@@ -144,10 +144,16 @@ public class App {
      * with no one-packet lag. TimeFinder handles playing (interpolated),
      * paused (beat-snapped), and CDJ-3000 precise-position modes.
      */
+    // For debug: track last logged values to avoid spamming the log
+    private static final Map<Integer, Long>  dbgLastPbt  = new ConcurrentHashMap<>();
+    private static final Map<Integer, Integer> dbgLastBeat = new ConcurrentHashMap<>();
+
     private static long resolvePlaybackTime(int player) {
         try {
             TrackPositionUpdate pos = TimeFinder.getInstance().getLatestPositionFor(player);
-            if (pos != null) return pos.milliseconds;
+            long result = (pos != null) ? pos.milliseconds : -1;
+            // Debug: log whenever beat or playbackTime changes significantly
+            return result;
         } catch (Exception ignored) {}
         return -1;
     }
@@ -250,10 +256,26 @@ public class App {
                             DeviceFinder.getInstance().getLatestAnnouncementFrom(deviceNumber);
                     if (announcement == null) return;
 
+                    int    rawBeat   = cdjStatus.getBeatNumber();
+                    long   pbt       = resolvePlaybackTime(deviceNumber);
+                    // Debug: log beat + playbackTime when they change (throttled)
+                    long   lastPbt   = dbgLastPbt.getOrDefault(deviceNumber, Long.MIN_VALUE);
+                    int    lastBeat  = dbgLastBeat.getOrDefault(deviceNumber, Integer.MIN_VALUE);
+                    if (rawBeat != lastBeat || Math.abs(pbt - lastPbt) > 500) {
+                        TrackPositionUpdate dbgPos = TimeFinder.getInstance().getLatestPositionFor(deviceNumber);
+                        BeatGrid dbgGrid = BeatGridFinder.getInstance().getLatestBeatGridFor(deviceNumber);
+                        System.err.printf("[DBG p%d] beat=%d  pbt=%d  tf=%s  grid=%s  state=%s%n",
+                                deviceNumber, rawBeat, pbt,
+                                dbgPos == null ? "null" : dbgPos.milliseconds + "ms",
+                                dbgGrid == null ? "null" : dbgGrid.beatCount + "beats",
+                                cdjStatus.getPlayState1());
+                        dbgLastPbt.put(deviceNumber, pbt);
+                        dbgLastBeat.put(deviceNumber, rawBeat);
+                    }
                     DeviceStatus deviceStatus = new DeviceStatus(
                             deviceNumber,
                             cdjStatus.isPlaying() || !cdjStatus.isPaused(),
-                            cdjStatus.getBeatNumber(),
+                            rawBeat,
                             update.getBeatWithinBar(),
                             Double.parseDouble(df.format(update.getEffectiveTempo())),
                             Double.parseDouble(df.format(Util.pitchToPercentage(update.getPitch()))),
@@ -262,7 +284,7 @@ public class App {
                             cdjStatus.getRekordboxId(),
                             update.getDeviceName(),
                             cdjStatus.isTempoMaster(),
-                            resolvePlaybackTime(deviceNumber)
+                            pbt
                     );
                     deviceWebSocketServer.broadcastStatus(deviceStatus);
                 } catch (Exception e) {
