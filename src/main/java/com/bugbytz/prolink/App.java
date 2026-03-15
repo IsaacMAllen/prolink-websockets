@@ -182,14 +182,14 @@ public class App {
         // loads, making it the earliest reliable signal for full-track waveform data.
         WaveformFinder.getInstance().addWaveformListener(new WaveformListener() {
             @Override
-            public void waveformPreviewChanged(WaveformPreviewUpdate update) {
+            public void previewChanged(WaveformPreviewUpdate update) {
                 if (update.preview != null) {
                     sendStaticWaveformForPlayer(update.player);
                 }
             }
 
             @Override
-            public void waveformDetailChanged(WaveformDetailUpdate update) {
+            public void detailChanged(WaveformDetailUpdate update) {
                 // Detail not used — playhead is computed client-side.
             }
         });
