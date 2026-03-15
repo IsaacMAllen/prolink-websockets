@@ -1,0 +1,3 @@
+sudo ip addr flush dev enp1s0
+sudo ip addr add 169.254.1.10/16 brd 169.254.255.255 dev enp1s0
+sudo ip link set enp1s0 up

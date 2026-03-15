@@ -36,6 +36,7 @@ public class DBService implements DatabaseListener {
                         trackRow.duration() % 60,
                         slot.player
                 );
+		System.out.println("Broadcasting Track: " + extractText(trackRow.title()));
                 wsServer.broadcastTrack(track);
             });
         } catch (Exception e) {

@@ -151,7 +151,7 @@ public class App {
     }
 
     public static void main(String[] args) throws Exception {
-        VirtualCdj.getInstance().setDeviceNumber((byte) 5);
+        VirtualCdj.getInstance().setDeviceNumber((byte) 1);
         CrateDigger.getInstance().addDatabaseListener(new DBService());
 
         VirtualCdj.getInstance().addUpdateListener(update -> {
@@ -196,6 +196,7 @@ public class App {
             public void deviceFound(DeviceAnnouncement announcement) {
                 if (!VirtualCdj.getInstance().isRunning()) {
                     try {
+                        VirtualCdj.getInstance().setSendingStatus(true);
                         VirtualCdj.getInstance().start();
                         CrateDigger.getInstance().start();
                     } catch (Exception e) {

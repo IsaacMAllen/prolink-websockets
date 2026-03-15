@@ -5,7 +5,7 @@ import java.nio.ByteBuffer;
 public class NativeWaveformRenderer {
     static {
         try {
-            System.load("/Users/isallen/Development/prolink_db_access/src/main/resources/libwaveform.dylib");
+            System.load("/home/lc4/prolink-websockets/src/main/resources/libwaveform.so");
             System.err.println("✅ Native waveform library loaded successfully");
         } catch (UnsatisfiedLinkError e) {
             System.err.println("❌ Failed to load native waveform library: " + e.getMessage());
