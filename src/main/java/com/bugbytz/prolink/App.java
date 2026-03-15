@@ -137,24 +137,19 @@ public class App {
 
 
     /**
-     * Returns the track position in milliseconds for the given player and beat number,
-     * using the BeatGrid for precision (accurate during scrub, cue, variable-BPM tracks).
-     * Falls back to TimeFinder interpolation, then -1 if neither is available.
-     *
-     * BeatGrid is preferred over TimeFinder because our addUpdateListener fires
-     * before TimeFinder processes the same packet, making getTimeFor() always one
-     * packet behind the current position.
+     * Returns the track position in milliseconds for the given player.
+     * Because our addUpdateListener is registered AFTER TimeFinder.start(),
+     * TimeFinder's internal listener runs first on every packet — so
+     * getLatestPositionFor() reflects the current packet's computed position
+     * with no one-packet lag. TimeFinder handles playing (interpolated),
+     * paused (beat-snapped), and CDJ-3000 precise-position modes.
      */
-    private static long resolvePlaybackTime(int player, int beatNumber) {
+    private static long resolvePlaybackTime(int player) {
         try {
-            BeatGrid grid = BeatGridFinder.getInstance().getLatestBeatGridFor(player);
-            if (grid != null && beatNumber > 0 && beatNumber <= grid.beatCount) {
-                return grid.getTimeWithinTrack(beatNumber);
-            }
+            TrackPositionUpdate pos = TimeFinder.getInstance().getLatestPositionFor(player);
+            if (pos != null) return pos.milliseconds;
         } catch (Exception ignored) {}
-        // Fallback: TimeFinder sub-beat interpolation (may be one packet stale)
-        long t = TimeFinder.getInstance().getTimeFor(player);
-        return t >= 0 ? t : -1;
+        return -1;
     }
 
     public static void main(String[] args) throws Exception {
@@ -162,43 +157,6 @@ public class App {
         VirtualCdj.getInstance().setDeviceNumber((byte) 5);
         CrateDigger.getInstance().addDatabaseListener(new DBService());
 
-        // DeviceStatus (beat, tempo, pitch, isMaster, etc.) — consumed by the client to
-        // calculate the live playhead position against the static waveform texture.
-        VirtualCdj.getInstance().addUpdateListener(update -> {
-            if (update instanceof CdjStatus cdjStatus) {
-                int deviceNumber = update.getDeviceNumber();
-                AtomicBoolean sendingFlag =
-                        deviceSending.computeIfAbsent(deviceNumber, k -> new AtomicBoolean(false));
-                if (!sendingFlag.compareAndSet(false, true)) return;
-
-                DecimalFormat df = new DecimalFormat("#.##");
-                try {
-                    DeviceAnnouncement announcement =
-                            DeviceFinder.getInstance().getLatestAnnouncementFrom(deviceNumber);
-                    if (announcement == null) return;
-
-                    DeviceStatus deviceStatus = new DeviceStatus(
-                            deviceNumber,
-                            cdjStatus.isPlaying() || !cdjStatus.isPaused(),
-                            cdjStatus.getBeatNumber(),
-                            update.getBeatWithinBar(),
-                            Double.parseDouble(df.format(update.getEffectiveTempo())),
-                            Double.parseDouble(df.format(Util.pitchToPercentage(update.getPitch()))),
-                            update.getAddress().getHostAddress(),
-                            byteArrayToMacString(announcement.getHardwareAddress()),
-                            cdjStatus.getRekordboxId(),
-                            update.getDeviceName(),
-                            cdjStatus.isTempoMaster(),
-                            resolvePlaybackTime(deviceNumber, cdjStatus.getBeatNumber())
-                    );
-                    deviceWebSocketServer.broadcastStatus(deviceStatus);
-                } catch (Exception e) {
-                    e.printStackTrace();
-                } finally {
-                    sendingFlag.set(false);
-                }
-            }
-        });
 
         // Fire a one-shot static waveform render whenever a new waveform preview arrives.
         // This is the primary trigger: preview data becomes available shortly after a track
@@ -276,6 +234,44 @@ public class App {
         BeatGridFinder.getInstance().start();
         MetadataFinder.getInstance().start();
         TimeFinder.getInstance().start();
+
+        // DeviceStatus (beat, tempo, pitch, isMaster, etc.) — consumed by the client to
+        // calculate the live playhead position against the static waveform texture.
+        VirtualCdj.getInstance().addUpdateListener(update -> {
+            if (update instanceof CdjStatus cdjStatus) {
+                int deviceNumber = update.getDeviceNumber();
+                AtomicBoolean sendingFlag =
+                        deviceSending.computeIfAbsent(deviceNumber, k -> new AtomicBoolean(false));
+                if (!sendingFlag.compareAndSet(false, true)) return;
+
+                DecimalFormat df = new DecimalFormat("#.##");
+                try {
+                    DeviceAnnouncement announcement =
+                            DeviceFinder.getInstance().getLatestAnnouncementFrom(deviceNumber);
+                    if (announcement == null) return;
+
+                    DeviceStatus deviceStatus = new DeviceStatus(
+                            deviceNumber,
+                            cdjStatus.isPlaying() || !cdjStatus.isPaused(),
+                            cdjStatus.getBeatNumber(),
+                            update.getBeatWithinBar(),
+                            Double.parseDouble(df.format(update.getEffectiveTempo())),
+                            Double.parseDouble(df.format(Util.pitchToPercentage(update.getPitch()))),
+                            update.getAddress().getHostAddress(),
+                            byteArrayToMacString(announcement.getHardwareAddress()),
+                            cdjStatus.getRekordboxId(),
+                            update.getDeviceName(),
+                            cdjStatus.isTempoMaster(),
+                            resolvePlaybackTime(deviceNumber)
+                    );
+                    deviceWebSocketServer.broadcastStatus(deviceStatus);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                } finally {
+                    sendingFlag.set(false);
+                }
+            }
+        });
         DeviceFinder.getInstance().start();
         trackWebSocketServer.start();
         deviceWebSocketServer.start();
