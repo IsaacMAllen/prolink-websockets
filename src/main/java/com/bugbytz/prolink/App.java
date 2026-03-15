@@ -148,7 +148,7 @@ public class App {
     private static long resolvePlaybackTime(int player, int beatNumber) {
         try {
             BeatGrid grid = BeatGridFinder.getInstance().getLatestBeatGridFor(player);
-            if (grid != null && beatNumber > 0 && beatNumber <= grid.getBeatCount()) {
+            if (grid != null && beatNumber > 0 && beatNumber <= grid.beatCount) {
                 return grid.getTimeWithinTrack(beatNumber);
             }
         } catch (Exception ignored) {}
