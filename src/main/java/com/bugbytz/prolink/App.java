@@ -135,6 +135,28 @@ public class App {
         });
     }
 
+
+    /**
+     * Returns the track position in milliseconds for the given player and beat number,
+     * using the BeatGrid for precision (accurate during scrub, cue, variable-BPM tracks).
+     * Falls back to TimeFinder interpolation, then -1 if neither is available.
+     *
+     * BeatGrid is preferred over TimeFinder because our addUpdateListener fires
+     * before TimeFinder processes the same packet, making getTimeFor() always one
+     * packet behind the current position.
+     */
+    private static long resolvePlaybackTime(int player, int beatNumber) {
+        try {
+            BeatGrid grid = BeatGridFinder.getInstance().getLatestBeatGridFor(player);
+            if (grid != null && beatNumber > 0 && beatNumber <= grid.getBeatCount()) {
+                return grid.getTimeWithinTrack(beatNumber);
+            }
+        } catch (Exception ignored) {}
+        // Fallback: TimeFinder sub-beat interpolation (may be one packet stale)
+        long t = TimeFinder.getInstance().getTimeFor(player);
+        return t >= 0 ? t : -1;
+    }
+
     public static void main(String[] args) throws Exception {
         System.setProperty("java.awt.headless", "true");
         VirtualCdj.getInstance().setDeviceNumber((byte) 5);
@@ -167,7 +189,7 @@ public class App {
                             cdjStatus.getRekordboxId(),
                             update.getDeviceName(),
                             cdjStatus.isTempoMaster(),
-                            TimeFinder.getInstance().getTimeFor(deviceNumber)
+                            resolvePlaybackTime(deviceNumber, cdjStatus.getBeatNumber())
                     );
                     deviceWebSocketServer.broadcastStatus(deviceStatus);
                 } catch (Exception e) {
