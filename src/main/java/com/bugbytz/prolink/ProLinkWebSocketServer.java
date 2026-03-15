@@ -19,6 +19,10 @@ public class ProLinkWebSocketServer extends WebSocketServer {
     private Consumer<String> messageHandler = null;
     private final ObjectMapper mapper = new ObjectMapper();
 
+    // Cached so late-connecting clients (e.g. after a reconnect) immediately receive
+    // the current track's waveform without waiting for the next track-load event.
+    private volatile byte[] lastBinaryFrame = null;
+
     private final Set<WebSocket> clients = Collections.synchronizedSet(new HashSet<>());
     private final ExecutorService sendExecutor = new ThreadPoolExecutor(
             4, 4,
@@ -35,6 +39,12 @@ public class ProLinkWebSocketServer extends WebSocketServer {
     public void onOpen(WebSocket conn, ClientHandshake handshake) {
         clients.add(conn);
         System.out.println("Client connected: " + conn.getRemoteSocketAddress());
+        // Immediately replay the last static waveform so the client doesn't have to
+        // wait for the next track-load event to populate its texture.
+        byte[] last = lastBinaryFrame;
+        if (last != null) {
+            try { conn.send(last); } catch (Exception ignored) {}
+        }
     }
 
     @Override
@@ -61,12 +71,14 @@ public class ProLinkWebSocketServer extends WebSocketServer {
     }
 
     /**
-     * Broadcasts the given RGBA frame to all connected clients.
+     * Broadcasts the given RGBA frame to all connected clients and caches it so
+     * future clients receive it immediately on connect.
      *
-     * Assumes that the caller will not modify the buffer after this call.
-     * If mutation is possible, the caller should pass a clone instead.
+     * The caller must pass a stable buffer (use {@code .clone()} if the underlying
+     * array may be reused).
      */
     public void broadcastFrame(byte[] rawRgbaFrame) {
+        lastBinaryFrame = rawRgbaFrame;
         sendExecutor.submit(() -> {
             synchronized (clients) {
                 for (WebSocket client : clients) {
