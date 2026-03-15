@@ -17,4 +17,5 @@ public class DeviceStatus {
     private int rekordboxId;
     private String deviceName;
     private boolean isMaster;
+    private long playbackTime; // exact track position in ms from TimeFinder; -1 if unavailable
 }

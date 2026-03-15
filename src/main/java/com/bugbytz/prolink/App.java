@@ -166,7 +166,8 @@ public class App {
                             byteArrayToMacString(announcement.getHardwareAddress()),
                             cdjStatus.getRekordboxId(),
                             update.getDeviceName(),
-                            cdjStatus.isTempoMaster()
+                            cdjStatus.isTempoMaster(),
+                            TimeFinder.getInstance().getTimeFor(deviceNumber)
                     );
                     deviceWebSocketServer.broadcastStatus(deviceStatus);
                 } catch (Exception e) {
