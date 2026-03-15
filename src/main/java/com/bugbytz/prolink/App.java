@@ -58,9 +58,9 @@ public class App {
      * Renders a full-track waveform preview (STATIC_WIDTH × STATIC_HEIGHT, RGBA) for
      * {@code player} and broadcasts it to all connected clients on port {@code 8000 + player}.
      *
-     * Triggered once when the waveform preview data becomes available (i.e. a new track loads).
-     * The client caches this texture and animates a local playhead using beat + tempo from the
-     * continuous DeviceStatus stream — no further frames are sent until the next track change.
+     * Renders directly from WaveformPreview segment data — no Swing component needed, works
+     * correctly in any headless environment. Triggered once per track load; the client caches
+     * the texture and animates a local playhead using beat + tempo from DeviceStatus.
      */
     private static void sendStaticWaveformForPlayer(int player) {
         renderExecutor.submit(() -> {
@@ -71,23 +71,46 @@ public class App {
                     return;
                 }
 
-                TrackMetadata meta     = MetadataFinder.getInstance().getLatestMetadataFor(player);
-                BeatGrid      beatGrid = BeatGridFinder.getInstance().getLatestBeatGridFor(player);
-
-                // WaveformPreviewComponent renders the full track as a compact overview strip.
-                WaveformPreviewComponent comp =
-                        (WaveformPreviewComponent) preview.createViewComponent(meta, beatGrid);
-                comp.setPreferredSize(new Dimension(STATIC_WIDTH, STATIC_HEIGHT));
-                comp.setSize(STATIC_WIDTH, STATIC_HEIGHT);
-
                 BufferedImage img = new BufferedImage(STATIC_WIDTH, STATIC_HEIGHT,
                                                       BufferedImage.TYPE_4BYTE_ABGR);
                 Graphics2D g = img.createGraphics();
-                g.setRenderingHint(RenderingHints.KEY_ANTIALIASING,  RenderingHints.VALUE_ANTIALIAS_ON);
-                g.setRenderingHint(RenderingHints.KEY_RENDERING,     RenderingHints.VALUE_RENDER_QUALITY);
                 g.setBackground(Color.BLACK);
                 g.clearRect(0, 0, STATIC_WIDTH, STATIC_HEIGHT);
-                comp.paint(g);
+
+                final int segs      = preview.segmentCount;
+                final int maxH      = Math.max(preview.maxHeight, 1);
+                final boolean is3b  = preview.style == WaveformFinder.WaveformStyle.THREE_BAND;
+
+                for (int col = 0; col < STATIC_WIDTH; col++) {
+                    int seg = col * segs / STATIC_WIDTH;
+                    if (seg >= segs) seg = segs - 1;
+
+                    if (is3b) {
+                        // Heights are cumulative: LOW ⊂ MID ⊂ HIGH
+                        int lowH  = preview.segmentHeight(seg, WaveformFinder.ThreeBandLayer.LOW);
+                        int midH  = preview.segmentHeight(seg, WaveformFinder.ThreeBandLayer.MID);
+                        int highH = preview.segmentHeight(seg, WaveformFinder.ThreeBandLayer.HIGH);
+                        if (highH > 0) {
+                            int yHigh = STATIC_HEIGHT - highH * STATIC_HEIGHT / maxH;
+                            int yMid  = STATIC_HEIGHT - midH  * STATIC_HEIGHT / maxH;
+                            int yLow  = STATIC_HEIGHT - lowH  * STATIC_HEIGHT / maxH;
+                            g.setColor(new Color(160, 222, 255)); // high — cyan/white
+                            g.fillRect(col, yHigh, 1, Math.max(0, yMid  - yHigh));
+                            g.setColor(new Color(0,   220,  80)); // mid  — green
+                            g.fillRect(col, yMid,  1, Math.max(0, yLow  - yMid));
+                            g.setColor(new Color(255, 120,   0)); // low  — orange
+                            g.fillRect(col, yLow,  1, Math.max(0, STATIC_HEIGHT - yLow));
+                        }
+                    } else {
+                        int height = preview.segmentHeight(seg, true);
+                        if (height > 0) {
+                            Color color  = preview.segmentColor(seg, true);
+                            int   pixH   = height * STATIC_HEIGHT / maxH;
+                            g.setColor(color);
+                            g.fillRect(col, STATIC_HEIGHT - pixH, 1, pixH);
+                        }
+                    }
+                }
                 g.dispose();
 
                 byte[] rawPixels = ((DataBufferByte) img.getRaster().getDataBuffer()).getData();
@@ -102,9 +125,9 @@ public class App {
                     return s;
                 });
 
-                // Pass a clone so the rgbaBuffers slot can be reused for future track loads.
                 srv.broadcastRawBytes(rgba.clone());
-                System.out.println("Static waveform broadcast for player " + player);
+                System.out.println("Static waveform broadcast for player " + player +
+                        " (" + segs + " segments, maxH=" + maxH + ", style=" + preview.style + ")");
 
             } catch (Exception e) {
                 e.printStackTrace();
@@ -113,6 +136,7 @@ public class App {
     }
 
     public static void main(String[] args) throws Exception {
+        System.setProperty("java.awt.headless", "true");
         VirtualCdj.getInstance().setDeviceNumber((byte) 5);
         CrateDigger.getInstance().addDatabaseListener(new DBService());
 
