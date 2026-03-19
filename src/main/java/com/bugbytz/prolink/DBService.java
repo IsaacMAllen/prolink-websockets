@@ -56,6 +56,10 @@ public class DBService implements DatabaseListener {
 
     @Override
     public void databaseUnmounted(SlotReference slot, Database database) {
-        System.out.println("");
+        // Flush the library cache so stale tracks from the old USB drive are not
+        // replayed to the next client.  The cache will refill when the new drive
+        // mounts and databaseMounted() fires again.
+        App.getTrackWebSocketServer().clearJsonCache();
+        System.out.println("Database unmounted for slot " + slot);
     }
 }

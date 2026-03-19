@@ -8,8 +8,6 @@ import org.java_websocket.handshake.ClientHandshake;
 
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
@@ -22,44 +20,51 @@ public class ProLinkWebSocketServer extends WebSocketServer {
     private final Map<WebSocket, ClientConnection> clients = new ConcurrentHashMap<>();
 
     private final ByteBuffer framePool = ByteBuffer.allocateDirect(FRAME_SIZE);
-
     private static final int FRAME_SIZE = 800 * 200 * 4;
 
-    private final ConcurrentLinkedQueue<byte[]> pendingBinaryMessages = new ConcurrentLinkedQueue<>();
-    private final ConcurrentLinkedQueue<byte[]> pendingJsonMessages = new ConcurrentLinkedQueue<>();
+    // Persistent JSON cache — replayed to every new client that connects.
+    // Enabled on servers that broadcast library / metadata (port 2000).
+    // Remains populated across compositor restarts so reconnecting clients
+    // immediately receive the full library without waiting for a new USB mount.
+    private final List<byte[]> jsonCache = new CopyOnWriteArrayList<>();
+    private volatile boolean cacheJson = false;
 
-    // Cached so reconnecting clients immediately receive the latest waveform/art
-    // without waiting for the next track-load event.
+    // Last binary frame (waveform / art) — replayed to reconnecting clients.
     private volatile byte[] lastBinaryFrame = null;
 
     public ProLinkWebSocketServer(int port) {
         super(new InetSocketAddress(port));
     }
 
+    /** Enable persistent JSON caching (call before start() for track server). */
+    public void enableJsonCache() {
+        this.cacheJson = true;
+    }
+
+    /** Clear the JSON cache (call when the database unmounts). */
+    public void clearJsonCache() {
+        jsonCache.clear();
+        System.out.println("[port " + getPort() + "] JSON cache cleared");
+    }
+
     @Override
     public void onOpen(WebSocket conn, ClientHandshake handshake) {
         clients.put(conn, new ClientConnection(conn));
-        System.out.println("Client connected: " + conn.getRemoteSocketAddress());
+        System.out.println("Client connected: " + conn.getRemoteSocketAddress()
+                + "  (cache=" + jsonCache.size() + " msgs)");
 
-        // Flush any binary messages that arrived before the first client connected.
-        boolean hadPendingBinary = false;
-        byte[] msg;
-        while ((msg = pendingBinaryMessages.poll()) != null) {
-            conn.send(msg);
-            hadPendingBinary = true;
-        }
-        // If the queue was already empty, other clients were connected when the last
-        // frame was sent — replay the cached frame so this client isn't left blank.
-        if (!hadPendingBinary) {
-            byte[] last = lastBinaryFrame;
-            if (last != null) {
-                try { conn.send(last); } catch (Exception ignored) {}
+        // Replay entire JSON cache so the client gets the full library immediately,
+        // even if the database mounted long before this connection was opened.
+        if (!jsonCache.isEmpty()) {
+            for (byte[] msg : jsonCache) {
+                try { conn.send(msg); } catch (Exception ignored) {}
             }
         }
 
-        // Also flush pending JSON messages
-        while ((msg = pendingJsonMessages.poll()) != null) {
-            conn.send(msg);
+        // Replay the last binary frame (waveform / album art).
+        byte[] last = lastBinaryFrame;
+        if (last != null) {
+            try { conn.send(last); } catch (Exception ignored) {}
         }
     }
 
@@ -67,7 +72,7 @@ public class ProLinkWebSocketServer extends WebSocketServer {
     public void onClose(WebSocket conn, int code, String reason, boolean remote) {
         ClientConnection removed = clients.remove(conn);
         if (removed != null) removed.shutdown();
-        System.out.println("Client disconnected");
+        System.out.println("Client disconnected (code=" + code + ")");
     }
 
     @Override
@@ -79,26 +84,19 @@ public class ProLinkWebSocketServer extends WebSocketServer {
 
     @Override
     public void onError(WebSocket conn, Exception ex) {
-        ex.printStackTrace();
+        // Log but do NOT rethrow — keeps the server alive on transient errors.
+        System.err.println("[WebSocket error] " + ex.getMessage());
     }
 
     @Override
     public void onStart() {
-        System.out.println("WebSocket server started");
+        System.out.println("WebSocket server started on port " + getPort());
     }
+
+    // ── Frame broadcasting ────────────────────────────────────────────────────
 
     private final ExecutorService websocketExecutor = Executors.newFixedThreadPool(64);
-
     private final AtomicReference<ByteBuffer> latestFrame = new AtomicReference<>();
-
-    public void broadcastFrame(ByteBuffer rawRgbaBuffer) {
-        synchronized (framePool) {
-            framePool.clear();
-            framePool.put(rawRgbaBuffer.asReadOnlyBuffer());
-            framePool.flip();
-            latestFrame.set(framePool.asReadOnlyBuffer()); // this is cheap
-        }
-    }
 
     {
         Thread dispatcher = new Thread(() -> {
@@ -106,11 +104,11 @@ public class ProLinkWebSocketServer extends WebSocketServer {
                 ByteBuffer frame = latestFrame.getAndSet(null);
                 if (frame != null) {
                     for (ClientConnection conn : clients.values()) {
-                        conn.sendFrame(frame); // aggressively drops old frames
+                        conn.sendFrame(frame);
                     }
                 }
                 try {
-                    Thread.sleep(1); // low CPU
+                    Thread.sleep(1);
                 } catch (InterruptedException ignored) {}
             }
         }, "WebSocket-BroadcastDispatcher");
@@ -118,10 +116,18 @@ public class ProLinkWebSocketServer extends WebSocketServer {
         dispatcher.start();
     }
 
+    public void broadcastFrame(ByteBuffer rawRgbaBuffer) {
+        synchronized (framePool) {
+            framePool.clear();
+            framePool.put(rawRgbaBuffer.asReadOnlyBuffer());
+            framePool.flip();
+            latestFrame.set(framePool.asReadOnlyBuffer());
+        }
+    }
+
     public void broadcastStatus(DeviceStatus status) {
         try {
-            byte[] bytes = mapper.writeValueAsBytes(status);
-            broadcastJsonBytes(bytes);
+            broadcastJsonBytes(mapper.writeValueAsBytes(status));
         } catch (JsonProcessingException e) {
             throw new RuntimeException(e);
         }
@@ -129,32 +135,26 @@ public class ProLinkWebSocketServer extends WebSocketServer {
 
     public void broadcastTrack(Track track) {
         try {
-            byte[] bytes = mapper.writeValueAsBytes(track);
-            broadcastJsonBytes(bytes);
+            broadcastJsonBytes(mapper.writeValueAsBytes(track));
         } catch (JsonProcessingException e) {
             throw new RuntimeException(e);
         }
     }
 
     private void broadcastJsonBytes(byte[] bytes) {
-        if (clients.isEmpty()) {
-            pendingJsonMessages.add(bytes);
-        } else {
-            for (ClientConnection conn : clients.values()) {
-                websocketExecutor.submit(() -> conn.sendFrame(bytes));
-            }
+        // Cache for future clients (if enabled).
+        if (cacheJson) jsonCache.add(bytes);
+
+        // Send to all currently connected clients.
+        for (ClientConnection conn : clients.values()) {
+            websocketExecutor.submit(() -> conn.sendFrame(bytes));
         }
     }
 
     public void broadcastRawBytes(byte[] bytes) {
-        lastBinaryFrame = bytes; // cache for reconnecting clients
-        if (clients.isEmpty()) {
-            // No clients yet — queue for later
-            pendingBinaryMessages.add(bytes);
-        } else {
-            for (ClientConnection conn : clients.values()) {
-                websocketExecutor.submit(() -> conn.sendFrame(bytes));
-            }
+        lastBinaryFrame = bytes;   // cache for reconnecting clients
+        for (ClientConnection conn : clients.values()) {
+            websocketExecutor.submit(() -> conn.sendFrame(bytes));
         }
     }
 

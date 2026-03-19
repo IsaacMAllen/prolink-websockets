@@ -295,6 +295,9 @@ public class App {
             }
         });
         DeviceFinder.getInstance().start();
+        // Enable JSON caching on the track server so reconnecting clients
+        // receive the full library immediately without needing a new USB mount.
+        trackWebSocketServer.enableJsonCache();
         trackWebSocketServer.start();
         deviceWebSocketServer.start();
 
