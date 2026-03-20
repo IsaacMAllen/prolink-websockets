@@ -151,6 +151,11 @@ public class ProLinkWebSocketServer extends WebSocketServer {
         }
     }
 
+    /** Public variant used by DBService for pre-serialised JSON bytes (playlist nodes). */
+    public void broadcastRawJson(byte[] bytes) {
+        broadcastJsonBytes(bytes);
+    }
+
     public void broadcastRawBytes(byte[] bytes) {
         lastBinaryFrame = bytes;   // cache for reconnecting clients
         for (ClientConnection conn : clients.values()) {

@@ -1,18 +1,27 @@
 package com.bugbytz.prolink;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.deepsymmetry.beatlink.data.DatabaseListener;
 import org.deepsymmetry.beatlink.data.SlotReference;
 import org.deepsymmetry.cratedigger.Database;
 import org.deepsymmetry.cratedigger.pdb.RekordboxPdb;
 
-import java.util.HashMap;
-import java.util.Map;
+import java.util.*;
 
 public class DBService implements DatabaseListener {
+
+    private final ObjectMapper mapper = new ObjectMapper();
+
     @Override
     public void databaseMounted(SlotReference slot, Database database) {
-        ProLinkWebSocketServer wsServer = App.getTrackWebSocketServer();
+        sendTracks(database);
+        sendPlaylists(database);
+    }
 
+    // ── Track library ─────────────────────────────────────────────────────────
+
+    private void sendTracks(Database database) {
+        ProLinkWebSocketServer wsServer = App.getTrackWebSocketServer();
         try {
             Map<Long, String> artists = new HashMap<>();
             database.artistIndex.forEach((id, artistRow) ->
@@ -43,23 +52,72 @@ public class DBService implements DatabaseListener {
         }
     }
 
+    // ── Playlist tree ─────────────────────────────────────────────────────────
 
-    private String extractText(RekordboxPdb.DeviceSqlString sqlString) {
-        if (sqlString.body() instanceof RekordboxPdb.DeviceSqlShortAscii) {
-            return ((RekordboxPdb.DeviceSqlShortAscii) sqlString.body()).text();
-        } else if (sqlString.body() instanceof RekordboxPdb.DeviceSqlLongUtf16le) {
-            return ((RekordboxPdb.DeviceSqlLongUtf16le) sqlString.body()).text();
-        } else {
-            return "Unknown SQL string type";
+    private void sendPlaylists(Database database) {
+        ProLinkWebSocketServer playlistServer = App.getPlaylistWebSocketServer();
+        try {
+            // Build track-ID sets per playlist from playlistIndex entries.
+            // PlaylistEntryRow has playlistId() and trackId(); entries are ordered
+            // by (playlistId, entryIndex) so we accumulate in insertion order.
+            Map<Long, List<Long>> playlistTracks = new LinkedHashMap<>();
+            try {
+                database.playlistIndex.forEach((key, entry) -> {
+                    long plId = entry.playlistId();
+                    long trId = entry.trackId();
+                    playlistTracks.computeIfAbsent(plId, k -> new ArrayList<>()).add(trId);
+                });
+            } catch (Exception ignored) {
+                // playlistIndex may not be populated on all firmware versions; fall through.
+            }
+
+            // Walk the tree: folders first, then leaf playlists.
+            database.playlistTreeIndex.forEach((id, treeRow) -> {
+                try {
+                    String name     = extractText(treeRow.name());
+                    boolean isFolder = treeRow.isFolder();
+                    long    parentId = treeRow.parentId();
+                    int     sort     = (int) treeRow.sortOrder();
+
+                    List<Long> trackIds = isFolder
+                            ? Collections.emptyList()
+                            : playlistTracks.getOrDefault(id, Collections.emptyList());
+
+                    PlaylistNode node = new PlaylistNode(id, name, isFolder, parentId, sort, trackIds);
+                    try {
+                        playlistServer.broadcastRawJson(mapper.writeValueAsBytes(node));
+                    } catch (Exception ex) {
+                        System.err.println("Failed to serialise PlaylistNode " + id + ": " + ex.getMessage());
+                    }
+                } catch (Exception rowEx) {
+                    System.err.println("Skipping playlist tree row: " + rowEx.getMessage());
+                }
+            });
+
+            System.out.println("Playlist tree sent (" + database.playlistTreeIndex.size() + " nodes)");
+        } catch (Exception e) {
+            System.err.println("Playlist tree send failed: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
+    // ── Database unmounted ────────────────────────────────────────────────────
+
     @Override
     public void databaseUnmounted(SlotReference slot, Database database) {
-        // Flush the library cache so stale tracks from the old USB drive are not
-        // replayed to the next client.  The cache will refill when the new drive
-        // mounts and databaseMounted() fires again.
         App.getTrackWebSocketServer().clearJsonCache();
-        System.out.println("Database unmounted for slot " + slot);
+        App.getPlaylistWebSocketServer().clearJsonCache();
+        System.out.println("Database unmounted for slot " + slot + " — caches cleared");
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private String extractText(RekordboxPdb.DeviceSqlString sqlString) {
+        if (sqlString.body() instanceof RekordboxPdb.DeviceSqlShortAscii ascii) {
+            return ascii.text();
+        } else if (sqlString.body() instanceof RekordboxPdb.DeviceSqlLongUtf16le utf16) {
+            return utf16.text();
+        }
+        return "Unknown SQL string type";
     }
 }
