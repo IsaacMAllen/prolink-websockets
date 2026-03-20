@@ -14,13 +14,13 @@ public class DBService implements DatabaseListener {
 
     @Override
     public void databaseMounted(SlotReference slot, Database database) {
-        sendTracks(database);
+        sendTracks(slot, database);
         sendPlaylists(database);
     }
 
     // ── Track library ─────────────────────────────────────────────────────────
 
-    private void sendTracks(Database database) {
+    private void sendTracks(SlotReference slot, Database database) {
         ProLinkWebSocketServer wsServer = App.getTrackWebSocketServer();
         try {
             Map<Long, String> artists = new HashMap<>();
@@ -53,51 +53,58 @@ public class DBService implements DatabaseListener {
     }
 
     // ── Playlist tree ─────────────────────────────────────────────────────────
+    //
+    // CrateDigger API:
+    //   database.playlistIndex       Map<Long, List<Long>>   playlist-id → ordered track IDs
+    //   database.playlistFolderIndex Map<Long, List<Database.PlaylistFolderEntry>>
+    //                                parent-id → children (0L = root)
+    //   PlaylistFolderEntry: .name (String), .isFolder (boolean), .id (long)
 
     private void sendPlaylists(Database database) {
         ProLinkWebSocketServer playlistServer = App.getPlaylistWebSocketServer();
         try {
-            // Build track-ID sets per playlist from playlistIndex entries.
-            // PlaylistEntryRow has playlistId() and trackId(); entries are ordered
-            // by (playlistId, entryIndex) so we accumulate in insertion order.
-            Map<Long, List<Long>> playlistTracks = new LinkedHashMap<>();
-            try {
-                database.playlistIndex.forEach((key, entry) -> {
-                    long plId = entry.playlistId();
-                    long trId = entry.trackId();
-                    playlistTracks.computeIfAbsent(plId, k -> new ArrayList<>()).add(trId);
-                });
-            } catch (Exception ignored) {
-                // playlistIndex may not be populated on all firmware versions; fall through.
-            }
-
-            // Walk the tree: folders first, then leaf playlists.
-            database.playlistTreeIndex.forEach((id, treeRow) -> {
-                try {
-                    String name     = extractText(treeRow.name());
-                    boolean isFolder = treeRow.isFolder();
-                    long    parentId = treeRow.parentId();
-                    int     sort     = (int) treeRow.sortOrder();
-
-                    List<Long> trackIds = isFolder
-                            ? Collections.emptyList()
-                            : playlistTracks.getOrDefault(id, Collections.emptyList());
-
-                    PlaylistNode node = new PlaylistNode(id, name, isFolder, parentId, sort, trackIds);
-                    try {
-                        playlistServer.broadcastRawJson(mapper.writeValueAsBytes(node));
-                    } catch (Exception ex) {
-                        System.err.println("Failed to serialise PlaylistNode " + id + ": " + ex.getMessage());
-                    }
-                } catch (Exception rowEx) {
-                    System.err.println("Skipping playlist tree row: " + rowEx.getMessage());
-                }
-            });
-
-            System.out.println("Playlist tree sent (" + database.playlistTreeIndex.size() + " nodes)");
+            sendFolderEntries(database, 0L, playlistServer);
+            System.out.println("Playlist tree sent.");
         } catch (Exception e) {
             System.err.println("Playlist tree send failed: " + e.getMessage());
             e.printStackTrace();
+        }
+    }
+
+    /** Recursively walk the playlist tree, broadcasting one PlaylistNode per entry. */
+    private void sendFolderEntries(Database database, long parentId,
+                                   ProLinkWebSocketServer server) {
+        List<Database.PlaylistFolderEntry> children =
+                database.playlistFolderIndex.get(parentId);
+        if (children == null) return;
+
+        for (Database.PlaylistFolderEntry entry : children) {
+            if (entry == null) continue; // sparse list can contain nulls
+
+            List<Long> trackIds = entry.isFolder
+                    ? Collections.emptyList()
+                    : database.playlistIndex.getOrDefault(entry.id, Collections.emptyList());
+
+            PlaylistNode node = new PlaylistNode(
+                    entry.id,
+                    entry.name,
+                    entry.isFolder,
+                    parentId,
+                    0,        // sortOrder not exposed via PlaylistFolderEntry; position in list is order
+                    new ArrayList<>(trackIds)
+            );
+
+            try {
+                server.broadcastRawJson(mapper.writeValueAsBytes(node));
+            } catch (Exception ex) {
+                System.err.println("Failed to serialise PlaylistNode " + entry.id
+                        + ": " + ex.getMessage());
+            }
+
+            // Recurse into folders
+            if (entry.isFolder) {
+                sendFolderEntries(database, entry.id, server);
+            }
         }
     }
 
